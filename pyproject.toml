@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handwritten"
+version = "0.1.0"
+description = "Learn your handwriting from iPad PDFs and render documents in it"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pymupdf>=1.24",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "scikit-image>=0.21",
+  "pillow>=10",
+  "Hershey-Fonts>=2.1",
+  "python-docx>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+handwritten = "handwritten.cli:main"
+
+[tool.setuptools]
+packages = ["handwritten"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

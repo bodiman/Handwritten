@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+# personal handwriting data and outputs stay local by default
+samples/
+*.hwstyle
+out/
