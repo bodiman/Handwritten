@@ -154,7 +154,7 @@ class Layout:
         pending_space = False
         for sp in spans:
             if sp.math:
-                box = render_math(sp.text, self.s, display=False, size=size)
+                box = self._fit_width(render_math(sp.text, self.s, display=False, size=size))
                 if not box.is_empty() or box.width > 0:
                     toks.append(_Token(box, pending_space and bool(toks)))
                 pending_space = False
@@ -170,7 +170,7 @@ class Layout:
                 if not word:
                     continue
                 sb = pending_space and bool(toks) and not (len(word) == 1 and word in NO_SPACE_BEFORE)
-                toks.append(_Token(self.s.word(word, size), sb))
+                toks.append(_Token(self._fit_width(self.s.word(word, size)), sb))
                 pending_space = False
             if text[-1].isspace():
                 pending_space = True
@@ -252,7 +252,7 @@ class Layout:
             elif b.kind == "rule":
                 self._rule()
             elif b.kind == "displaymath":
-                box = render_math(b.text, self.s, display=True)
+                box = self._fit_width(render_math(b.text, self.s, display=True))
                 x = max(self.left, 0.5 * (self.left + self.right) - 0.5 * box.width)
                 self._flow([_Token(box, False)], first_x=x)
             elif b.kind == "heading":
@@ -267,6 +267,17 @@ class Layout:
                 if toks:
                     self._flow(toks)
         return self.pages
+
+    def _fit_width(self, box: InkBox, avail: Optional[float] = None) -> InkBox:
+        """Shrink a box that is wider than the text block (formulas are never
+        broken across lines)."""
+        avail = (self.right - self.left) if avail is None else avail
+        if box.width <= avail or box.width <= 0:
+            return box
+        k = avail / box.width
+        out = box.transformed(np.array([[k, 0.0, 0.0], [0.0, k, 0.0]]))
+        out.width = box.width * k
+        return out
 
     def _item(self, b: Block) -> None:
         mx = self.left + b.level * self.o.indent * self.xh

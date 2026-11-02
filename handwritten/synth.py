@@ -4,8 +4,9 @@ For every character the synthesiser picks one of the writer's real samples
 (avoiding recent repeats), applies small random variation learned from the
 data (size, baseline, rotation, shear), and spaces letters with the
 writer's pair-specific letter gaps.  Characters the writer never wrote come
-from, in order: a case/shape analogue in the writer's own bank (``C`` from
-``c``, ``0`` from ``O`` ...), then a restyled Hershey single-stroke glyph.
+from, in order: a shape analogue in the writer's own bank (``0`` from ``O``,
+``c`` from ``C`` ...), then a restyled Hershey single-stroke glyph drawn as
+PencilKit-like filled pen strokes (``fallback.HersheyFallback.glyph_ink``).
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ ANALOGS: Dict[str, List[Tuple[str, str]]] = {
     "c": [("C", "xh")], "o": [("O", "xh"), ("0", "xh")], "s": [("S", "xh")], "v": [("V", "xh")],
     "w": [("W", "xh")], "x": [("X", "xh")], "z": [("Z", "xh")], "u": [("U", "xh")],
     "l": [("1", "same"), ("|", "same")], "1": [("l", "same")], "|": [("l", "same"), ("1", "same")],
-    "×": [("x", "same")], "−": [("-", "same")], "–": [("-", "same")],
+    "−": [("-", "same")], "–": [("-", "same")],
     "—": [("-", "wide")], "’": [("'", "same")], "‘": [("'", "same")], "“": [('"', "same")],
     "”": [('"', "same")], "′": [("'", "same")],
 }
@@ -51,7 +52,7 @@ class GlyphChoice:
 
 class Synthesizer:
     def __init__(self, style: Style, seed: Optional[int] = 0, x_height: Optional[float] = None,
-                 variation: float = 1.0, neatness: float = 0.0):
+                 variation: float = 1.0, neatness: float = 0.0, fallback_fills: bool = True):
         """
         x_height: target x-height in points (default: the writer's natural size)
         variation: multiplier on all learned random variation (0 = none)
@@ -64,6 +65,8 @@ class Synthesizer:
         self.var = float(variation)
         self.neat = float(np.clip(neatness, 0.0, 1.0))
         self.fallback = HersheyFallback.for_style(style)
+        self.fallback.var = self.var  # variation also scales fallback wobble / pressure noise
+        self.fallback_fills = bool(fallback_fills)
         self._recent: Dict[str, Deque[int]] = defaultdict(lambda: deque(maxlen=3))
         self.missing: Dict[str, int] = defaultdict(int)
         self.used_kind: Dict[str, str] = {}
@@ -114,11 +117,15 @@ class Synthesizer:
             w = g.width * (1.8 if mode == "wide" else k)
             return GlyphChoice(fills, [], w, g.top * (1.0 if mode == "wide" else k),
                                g.bottom * (1.0 if mode == "wide" else k), "analog")
-        fb = self.fallback.glyph(ch, self.rng)
+        if self.fallback_fills:
+            fb = self.fallback.glyph_ink(ch, self.rng)
+        else:
+            g2 = self.fallback.glyph(ch, self.rng)
+            fb = None if g2 is None else ([], g2[0], g2[1], g2[2], g2[3])
         if fb is not None:
-            lines, w, top, bottom = fb
+            fills, lines, w, top, bottom = fb
             self.used_kind.setdefault(ch, "fallback")
-            return GlyphChoice([], lines, w, top, bottom, "fallback")
+            return GlyphChoice(fills, lines, w, top, bottom, "fallback")
         self.missing[ch] += 1
         return GlyphChoice([], [], 0.6, 0.0, 0.0, "missing")
 

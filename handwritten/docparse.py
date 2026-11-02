@@ -28,6 +28,7 @@ class Block:
     spans: List[Span] = field(default_factory=list)
     level: int = 0  # heading level / list nesting
     marker: str = ""  # list marker as written ("1)", "-", "(a)")
+    hard_break: bool = False  # line ends with an explicit line break (not joined by reflow)
 
     @property
     def text(self) -> str:
@@ -39,6 +40,7 @@ PAGEBREAK_RE = re.compile(r"^\s*(\\newpage|\\pagebreak|\\clearpage|<!--\s*pagebr
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 BULLET_RE = re.compile(r"^(\s*)([-*+•])\s+(.*)$")
 NUMBER_RE = re.compile(r"^(\s*)(\(?[0-9]{1,3}[.)]|\(?[a-zA-Z][.)]|\([ivxlcIVXLC]+\)|[ivx]+\))\s+(.*)$")
+HARD_BREAK = "\ue200"  # internal marker for an explicit line break
 RULE_RE = re.compile(r"^\s*(\*\s*){3,}$|^\s*(-\s*){3,}$|^\s*(_\s*){3,}$")
 GOTO_RE = re.compile(r"^\s*(<!--\s*page\s+(\d+)\s*-->|\\page\{(\d+)\})\s*$", re.I)
 
@@ -102,20 +104,29 @@ _MD_PATTERNS = [
 ]
 
 
+_ESCAPES = {"\\*": "\ue000", "\\_": "\ue001", "\\#": "\ue002", "\\`": "\ue003", "\\~": "\ue004",
+            "\\[": "\ue005", "\\]": "\ue006"}
+
+
 def strip_markdown(t: str) -> str:
+    """Remove Markdown emphasis / code / link markup, honouring backslash escapes."""
+    for esc, ph in _ESCAPES.items():
+        t = t.replace(esc, ph)
     for pat, rep in _MD_PATTERNS:
         t = pat.sub(rep, t)
-    return t.replace("\\*", "*").replace("\\_", "_").replace("\\#", "#")
+    for esc, ph in _ESCAPES.items():
+        t = t.replace(ph, esc[1])
+    return t
 
 
 def parse_text(src: str, markdown: bool = True, reflow: bool = False) -> List[Block]:
     blocks: List[Block] = []
-    lines = src.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = src.replace("\r\n", "\n").replace("\r", "\n").replace("\f", "\n\\newpage\n").split("\n")
     i = 0
     while i < len(lines):
         raw = lines[i]
         line = raw.rstrip()
-        if PAGEBREAK_RE.match(line) or "\f" in raw:
+        if PAGEBREAK_RE.match(line):
             blocks.append(Block("pagebreak"))
             i += 1
             continue
@@ -168,11 +179,20 @@ def parse_text(src: str, markdown: bool = True, reflow: bool = False) -> List[Bl
                                         marker=m.group(2)))
                     i += 1
                     continue
-            blocks.append(Block("line", split_inline(line.strip(), markdown)))
+            hard = raw.endswith(HARD_BREAK) or (markdown and (raw.endswith("  ") or raw.rstrip().endswith("\\")
+                                                              and not raw.rstrip().endswith("\\\\")))
+            text = line.strip().rstrip(HARD_BREAK).rstrip()
+            if markdown and text.endswith("\\") and not text.endswith("\\\\"):
+                text = text[:-1].rstrip()
+            b = Block("line", split_inline(text, markdown))
+            b.hard_break = hard
+            blocks.append(b)
             i += 1
             continue
     if reflow:
         blocks = _reflow(blocks)
+    # collapse runs of blank lines into one paragraph gap
+    blocks = [b for k, b in enumerate(blocks) if not (b.kind == "blank" and k and blocks[k - 1].kind == "blank")]
     # drop leading/trailing blanks
     while blocks and blocks[0].kind == "blank":
         blocks.pop(0)
@@ -182,10 +202,14 @@ def parse_text(src: str, markdown: bool = True, reflow: bool = False) -> List[Bl
 
 
 def _reflow(blocks: List[Block]) -> List[Block]:
+    """Join consecutive lines into paragraphs (Markdown/TeX semantics); a
+    line ending in a hard break (two spaces, a backslash, TeX ``\\``) ends
+    its line."""
     out: List[Block] = []
     for b in blocks:
-        if b.kind == "line" and out and out[-1].kind in ("line", "item"):
+        if b.kind == "line" and out and out[-1].kind in ("line", "item") and not out[-1].hard_break:
             out[-1].spans = out[-1].spans + [Span(" ")] + b.spans
+            out[-1].hard_break = b.hard_break
         else:
             out.append(b)
     return out
@@ -237,25 +261,60 @@ def parse_docx(path: str | Path) -> List[Block]:
 
 
 _TEX_DROP = re.compile(r"\\(documentclass|usepackage|title|author|date|maketitle|label|vspace|hspace|noindent|"
-                       r"centering|setlength|newcommand|renewcommand)\b(\[[^\]]*\])?(\{[^}]*\})*")
-
+                       r"centering|setlength|newcommand|renewcommand|pagestyle|thispagestyle|bigskip|medskip|"
+                       r"smallskip|par)\b\*?(\[[^\]]*\])?(\{[^}]*\})*")
+_TEX_MATH = re.compile(
+    r"\\begin\{(equation|align|gather|multline|eqnarray|displaymath)(\*?)\}(.*?)\\end\{\1\2\}"
+    r"|\$\$(.+?)\$\$|\\\[(.+?)\\\]|(?<!\\)\$(.+?)(?<!\\)\$|\\\((.+?)\\\)", re.S)
 
 def parse_tex(src: str) -> List[Block]:
+    """Pragmatic LaTeX subset: sections, paragraphs, itemize/enumerate,
+    inline and display maths (multi-line align/gather become stacked rows),
+    \\textbf & co. (content kept), \\\\ line breaks, text escapes."""
     m = re.search(r"\\begin\{document\}(.*)\\end\{document\}", src, re.S)
     body = m.group(1) if m else src
     body = re.sub(r"(?<!\\)%.*", "", body)
+    # protect maths from the text transformations below
+    maths: List[str] = []
+
+    def keep(mm: "re.Match[str]") -> str:
+        env, _, env_body, dd, br, d, par = mm.groups()
+        if env is not None:
+            inner = " ".join(re.sub(r"\\(label|tag)\{[^}]*\}|\\nonumber|\\notag", "", env_body).split())
+            if env in ("align", "eqnarray"):
+                inner = "\\begin{aligned}" + inner + "\\end{aligned}"
+            elif env in ("gather", "multline"):
+                inner = "\\begin{gathered}" + inner + "\\end{gathered}"
+            maths.append("$$" + inner + "$$")
+            return "\n\ue100%d\ue101\n" % (len(maths) - 1)
+        if dd is not None or br is not None:
+            maths.append("$$" + " ".join((dd or br).split()) + "$$")
+            return "\n\ue100%d\ue101\n" % (len(maths) - 1)
+        maths.append("$" + " ".join((d or par).split()) + "$")
+        return "\ue100%d\ue101" % (len(maths) - 1)
+
+    body = _TEX_MATH.sub(keep, body)
     body = _TEX_DROP.sub("", body)
     body = re.sub(r"\\(section|subsection|subsubsection)\*?\{([^}]*)\}",
-                  lambda mm: "\n" + "#" * {"section": 1, "subsection": 2, "subsubsection": 3}[mm.group(1)] + " "
-                  + mm.group(2) + "\n", body)
-    body = re.sub(r"\\begin\{(equation|align|gather|multline)\*?\}(.*?)\\end\{\1\*?\}",
-                  lambda mm: "\n$$" + mm.group(2).replace("&", "").replace("\\\\", " ") + "$$\n", body, flags=re.S)
-    body = re.sub(r"\\begin\{(itemize|enumerate)\}|\\end\{(itemize|enumerate)\}", "\n", body)
-    body = re.sub(r"\\item\s*(\[[^\]]*\])?", lambda mm: "\n- " if not mm.group(1) else "\n" + mm.group(1)[1:-1] + " ",
-                  body)
-    body = re.sub(r"\\(textbf|textit|emph|underline|text)\{([^}]*)\}", r"\2", body)
-    body = body.replace("\\\\", "\n").replace("~", " ")
-    return parse_text(body, markdown=True)
+                  lambda mm: "\n\n" + "#" * {"section": 1, "subsection": 2, "subsubsection": 3}[mm.group(1)] + " "
+                  + mm.group(2) + "\n\n", body)
+    body = re.sub(r"\\(newpage|clearpage|pagebreak)\b", "\n\\\\newpage\n", body)
+    body = re.sub(r"\\begin\{(itemize|enumerate|description)\}|\\end\{(itemize|enumerate|description)\}",
+                  "\n\n", body)
+    def item(mm: "re.Match[str]") -> str:
+        if mm.group(1):
+            return "\n" + mm.group(1)[1:-1] + " "
+        return "\n- "
+
+    body = re.sub(r"\s*\\item\s*(\[[^\]]*\])?", item, body)
+    for _ in range(3):  # nested formatting commands
+        body = re.sub(r"\\(textbf|textit|textrm|textsf|texttt|emph|underline|text|mbox)\{([^{}]*)\}", r"\2", body)
+    body = body.replace("\\\\", HARD_BREAK + "\n").replace("~", " ")
+    for esc, lit in (("\\%", "%"), ("\\&", "&"), ("\\{", "{"), ("\\}", "}"), ("\\ldots", "..."),
+                     ("\\dots", "..."), ("``", "\u201c"), ("''", "\u201d"), ("---", "\u2014"), ("--", "\u2013")):
+        body = body.replace(esc, lit)
+    body = re.sub("\ue100(\\d+)\ue101", lambda mm: maths[int(mm.group(1))], body)
+    return parse_text(body, markdown=True, reflow=True)
 
 
 def parse_file(path: str | Path, reflow: Optional[bool] = None) -> List[Block]:

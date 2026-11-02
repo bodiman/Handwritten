@@ -56,12 +56,18 @@ def cmd_train(a: argparse.Namespace) -> int:
             style = train_style(seg, ink=ink, meta={"sources": [Path(f).name for f in files]},
                                 min_samples=a.min_samples)
     if cal_files:
-        from .template import style_from_sheets
+        from .template import merge_calibration, style_from_sheets
 
         cal = style_from_sheets(cal_files, base=style)
         n_cal = sum(len(v) for v in cal.bank.values())
-        style = cal if style is None else style.merge(cal)
-        _p(f"  {n_cal} glyphs from calibration sheet(s)")
+        if n_cal == 0:
+            _p("  warning: no handwriting found in the calibration sheet(s) - were they filled in and "
+               "exported as PDF?")
+        else:
+            _p(f"  {n_cal} glyphs from calibration sheet(s) (cells filled {cal.meta.get('sheet_cells_filled')}, "
+               f"rejected {cal.meta.get('sheet_rejected')})")
+        # trusted sheet samples replace scarce (often mis-recognised) free-text samples
+        style = cal if style is None else merge_calibration(style, cal)
     assert style is not None
     style.save(a.output)
     cov = style.coverage()
@@ -109,12 +115,18 @@ def cmd_render(a: argparse.Namespace) -> int:
     return 0
 
 
+INK_NAMES = {"black": (0.1, 0.1, 0.1), "blue": (0.08, 0.2, 0.6), "red": (0.75, 0.1, 0.1),
+             "green": (0.1, 0.45, 0.2), "pencil": (0.35, 0.35, 0.37)}
+
+
 def _parse_color(s: str):
-    s = s.strip().lstrip("#")
-    if len(s) == 6:
-        return tuple(int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
-    named = {"black": (0.1, 0.1, 0.1), "blue": (0.08, 0.2, 0.6), "red": (0.75, 0.1, 0.1)}
-    return named.get(s, (0.1, 0.1, 0.1))
+    t = s.strip().lower()
+    if t in INK_NAMES:
+        return INK_NAMES[t]
+    h = t.lstrip("#")
+    if len(h) == 6 and all(c in "0123456789abcdef" for c in h):
+        return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    raise SystemExit(f"error: unknown ink colour {s!r}; use one of {', '.join(INK_NAMES)} or #rrggbb")
 
 
 def cmd_inspect(a: argparse.Namespace) -> int:
@@ -173,9 +185,21 @@ def cmd_prune(a: argparse.Namespace) -> int:
 
 
 def cmd_template(a: argparse.Namespace) -> int:
-    from .template import make_template
+    from .template import chars_needed, make_template
 
-    make_template(a.output, chars=a.chars, repeats=a.repeats, paper=a.paper)
+    chars = a.chars
+    xh = a.size or 10.0
+    if a.for_style:
+        from .style import Style
+
+        st = Style.load(a.for_style)
+        chars = chars_needed(st, chars)
+        xh = a.size or round(st.stats.xh_pt, 1)
+        if not chars:
+            _p("nothing missing: every character already has enough samples")
+            return 0
+        _p(f"characters to write: {''.join(chars)}")
+    make_template(a.output, chars=chars, repeats=a.repeats, paper=a.paper, x_height=xh)
     _p(f"wrote {a.output}: print it or open it on your iPad, write each character in its boxes, "
        f"export as PDF and pass it to 'handwritten train ... --calibration sheet.pdf'")
     return 0
@@ -208,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--variation", type=float, default=1.0, help="randomness multiplier (0 = minimal)")
     r.add_argument("--neatness", type=float, default=0.0, help="0..1: straighter lines, steadier spacing")
     r.add_argument("--seed", type=int, default=None, help="random seed (same seed = same output)")
-    r.add_argument("--ink", default=None, help="ink colour: black, blue, red or #rrggbb")
+    r.add_argument("--ink", default=None, help="ink colour: black, blue, red, green, pencil or #rrggbb")
     r.add_argument("--reflow", action="store_true", help="join lines into paragraphs")
     r.add_argument("--keep-lines", action="store_true", help="keep source line breaks")
     r.add_argument("--png", action="store_true", help="also write PNG previews")
@@ -232,6 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
     tp.add_argument("--chars", default=None, help="characters to include (default: full set)")
     tp.add_argument("--repeats", type=int, default=4)
     tp.add_argument("--paper", default="letter", choices=["letter", "a4"])
+    tp.add_argument("--for-style", default=None, help="only the characters this .hwstyle is missing or short of")
+    tp.add_argument("--size", type=float, default=None,
+                    help="guide x-height in pt (default 10, or the style's natural x-height)")
     tp.set_defaults(func=cmd_template)
     return ap
 

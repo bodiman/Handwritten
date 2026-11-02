@@ -15,6 +15,7 @@ It is saved as a ``.hwstyle`` file: a zip archive with ``style.json`` and
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
 import math
@@ -180,7 +181,7 @@ class Style:
                 bank.setdefault(c, []).append(BankGlyph(g.char, g.strokes, g.width, g.top, g.bottom, g.source,
                                                         next_id, g.pen))
                 next_id += 1
-        stats = self.stats
+        stats = copy.deepcopy(self.stats)
         stats.char_counts = {c: len(v) for c, v in bank.items()}
         return Style(stats=stats, bank=bank, meta=dict(self.meta))
 
